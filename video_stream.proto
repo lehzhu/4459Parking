@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package video;
+
+service VideoStreamService {
+  // Bidirectional streaming method for video frames.
+  rpc StreamVideo (stream VideoFrame) returns (stream VideoAck);
+}
+
+// Message representing a video frame.
+message VideoFrame {
+  int32 frame_number = 1;  // Frame identifier.
+  bytes data = 2;          // Simulated frame data (e.g., compressed image bytes).
+  int64 timestamp = 3;     // Unix timestamp for when the frame was captured.
+}
+
+// Acknowledgment message sent by the server.
+message VideoAck {
+  string message = 1;
+}

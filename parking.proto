@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package parking;
+
+// Service definition for parking updates.
+service ParkingService {
+  rpc Update (ParkingUpdateRequest) returns (ParkingUpdateResponse);
+}
+
+// A parking update message from a camera.
+message ParkingUpdateRequest {
+  string camera_id = 1;         // Unique identifier for the camera.
+  string location = 2;          // Physical location (e.g., "North Parking Lot").
+  int32 available_spaces = 3;   // Number of available parking spaces.
+  string status = 4;            // "OK" if data is valid, "ERROR" if there is an issue.
+  int64 timestamp = 5;          // Unix timestamp for when the update was generated.
+}
+
+// Response message acknowledging an update.
+message ParkingUpdateResponse {
+  string ack = 1;
+}
