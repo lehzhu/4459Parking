@@ -1,2 +1,5 @@
 .venv
+.vscode
 *pb2*.py*
+__pycache__
+raft_state.*
