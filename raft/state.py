@@ -1,7 +1,7 @@
 import pathlib
 from typing import Dict, List, Optional
 
-import msgpack
+import msgpack  # type: ignore
 
 from raft import raft_pb2
 
