@@ -5,7 +5,6 @@ import queue
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import (Any, Dict, List, Literal, Optional, Protocol, Set, Tuple,
                     Union)
 
@@ -23,6 +22,9 @@ class ElectionData:
 
 class FSM(Protocol):
     def apply(self, command: str) -> Any:
+        ...
+
+    def reset(self) -> Any:
         ...
 
 
@@ -43,6 +45,12 @@ class AppendEntriesResponse:
 class RequestVoteRequest:
     event: threading.Event
     request: raft_pb2.RequestVoteRequest
+
+
+@dataclasses.dataclass
+class RequestVoteResponse:
+    member_id: int
+    response: raft_pb2.RequestVoteResponse
 
 
 @dataclasses.dataclass
@@ -74,18 +82,12 @@ Action = Union[
     AppendLog,
     CommitLogs,
     RequestVoteRequest,
+    RequestVoteResponse,
     SendHeartbeat,
     Shutdown,
     Timeout,
 ]
 """These classes can all be in the req_queue"""
-
-
-@dataclasses.dataclass
-class RequestVoteResponse:
-    """Not put in queue currently. We wait for responses before doing anything else"""
-
-    response: raft_pb2.RequestVoteResponse
 
 
 @dataclasses.dataclass
@@ -103,43 +105,51 @@ class RaftNode:
         transport: RaftMessageTransport,
         members: List[int],
         fsm: FSM,
-        timeout_min_ms: int = 1000,
-        timeout_max_ms: int = 1500,
+        timeout_min_ms: int = 200,
+        timeout_max_ms: int = 400,
+        heartbeat_interval_ms: int = 100,
     ):
-        self.id = id
+        self._id = id
 
         format = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-        self.logger = logging.getLogger(f"raft_{self.id}")
-        self.logger.setLevel(logging.DEBUG)
-        fh = logging.FileHandler(f"raft_{self.id}.log", encoding="utf-8", mode="w")
+        self._logger = logging.getLogger(f"raft_{self._id}")
+        self._logger.setLevel(logging.DEBUG)
+        fh = logging.FileHandler(f"raft_{self._id}.log", encoding="utf-8", mode="w")
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(format)
-        self.logger.addHandler(fh)
+        self._logger.addHandler(fh)
 
-        self.state = state
+        self._state = state
         """Persistent state"""
 
-        self.timeout_min_ms = timeout_min_ms
-        self.timeout_max_ms = timeout_max_ms
-        self.timeout_task: Optional[threading.Timer] = None
-
-        self.heart_beat_task: Optional[threading.Thread] = None
+        self._timeout_min_ms = timeout_min_ms
+        self._timeout_max_ms = timeout_max_ms
+        self._heartbeat_interval_ms = heartbeat_interval_ms
 
         self._fsm = fsm
         self._members = members
         self._transport = transport
 
-        self.leader_id: Optional[int] = None
+        self._initialize()
+
+    def _initialize(self) -> None:
+        self._heartbeat_thread: Optional[threading.Thread] = None
+
+        self._timeout_thread: Optional[threading.Thread] = None
+        self._timeout_deadline: Optional[float] = None
+        self._timeout_thread_should_run: bool = False
+
+        self._leader_id: Optional[int] = None
         """ID of the current known leader"""
 
         """Volatile state on all servers (Reinitialized after election)"""
 
-        self.commit_index: int = 0
+        self._commit_index: int = 0
         """index of highest log entry known to be committed (initialized to 0, increases monotonically)"""
-        self.last_applied: int = 0
+        self._last_applied: int = 0
         """index of highest log entry applied to state machine (initialized to 0, increases monotonically)"""
 
-        self.leader_state = LeaderState()
+        self._leader_state = LeaderState()
         """State when this member is the leader"""
 
         self._role: Literal["F", "C", "L", "S"] = "F"
@@ -160,32 +170,62 @@ class RaftNode:
         self._log_events: Dict[int, threading.Event] = {}
         """Logs that have been appended but waiting to be committed"""
 
+        self._processing_lock = threading.Lock()
+
         self._processing_thread: Optional[threading.Thread] = None
 
-    # region api for user server
+        self._accepting_actions = False
 
-    def _check_running(self) -> None:
-        if not self._processing_thread:
-            raise RuntimeError("Server not running")
+    # region process api
+
+    def start_raft_processing(self) -> None:
+        with self._processing_lock:
+            if self._processing_thread and self._accepting_actions:
+                return
+
+            self._logger.warning(f"Start raft process for node {self._id}")
+            self._initialize()
+            self._fsm.reset()
+            self._processing_thread = threading.Thread(target=self._base_loop)
+            self._processing_thread.start()
+            self._accepting_actions = True
+
+    def stop_raft_processing(self) -> None:
+        with self._processing_lock:
+            self._accepting_actions = False
+
+            if self._processing_thread is None:
+                return
+
+            self._req_queue.put(Shutdown())
+
+        self._processing_thread.join()
+        self._processing_thread = None
+
+    def get_leader_id(self) -> Optional[int]:
+        with self._processing_lock:
+            self._check_running()
+            return self._leader_id
+
+    def force_timeout(self) -> None:
+        with self._processing_lock:
+            self._check_running()
+            self._req_queue.put(Timeout())
+
+    # region user api
 
     def append_log(self, command: str) -> AppendLogResponse:
         """Returns True if the command was applied to the FSM"""
-        self._check_running()
-        event = threading.Event()
-        self._req_queue.put(AppendLog(event, command))
-        self._event_to_append_log_response[event] = None
+        with self._processing_lock:
+            self._check_running()
+            event = threading.Event()
+            self._req_queue.put(AppendLog(event, command))
+            self._event_to_append_log_response[event] = None
+
         event.wait()
         res = self._event_to_append_log_response.pop(event)
         assert res is not None
         return res
-
-    def get_leader_id(self) -> Optional[int]:
-        self._check_running()
-        return self.leader_id
-
-    def force_timeout(self) -> None:
-        self._check_running()
-        self._req_queue.put(Timeout())
 
     # endregion
 
@@ -194,10 +234,12 @@ class RaftNode:
     def process_append_entries_request(
         self, request: raft_pb2.AppendEntriesRequest
     ) -> raft_pb2.AppendEntriesResponse:
-        self._check_running()
-        event = threading.Event()
-        self._req_queue.put(AppendEntriesRequest(event, request))
-        self._event_to_append_entries_response[event] = None
+        with self._processing_lock:
+            self._check_running()
+            event = threading.Event()
+            self._req_queue.put(AppendEntriesRequest(event, request))
+            self._event_to_append_entries_response[event] = None
+
         event.wait()
         res = self._event_to_append_entries_response.pop(event)
         assert res is not None
@@ -206,10 +248,11 @@ class RaftNode:
     def process_request_vote_request(
         self, request: raft_pb2.RequestVoteRequest
     ) -> raft_pb2.RequestVoteResponse:
-        self._check_running()
-        event = threading.Event()
-        self._req_queue.put(RequestVoteRequest(event, request))
-        self._event_to_request_vote_response[event] = None
+        with self._processing_lock:
+            self._check_running()
+            event = threading.Event()
+            self._req_queue.put(RequestVoteRequest(event, request))
+            self._event_to_request_vote_response[event] = None
         event.wait()
         res = self._event_to_request_vote_response.pop(event)
         assert res is not None
@@ -223,18 +266,18 @@ class RaftNode:
         self, request: raft_pb2.AppendEntriesRequest
     ) -> raft_pb2.AppendEntriesResponse:
         # reply false if term < current_term
-        if request.term < self.state.current_term:
+        if request.term < self._state.current_term:
             return raft_pb2.AppendEntriesResponse(
-                term=self.state.current_term, success=False
+                term=self._state.current_term, success=False
             )
 
         self._reset_timeout()
 
         # if request.term == self.term and we are leader; this should not be possible.
         # only the leader should be sending AppendEntries, and there can be only be one leader per term
-        if request.term == self.state.current_term:
-            assert self.leader_id != self.id
-            self.leader_id = request.leader_id
+        if request.term == self._state.current_term:
+            assert self._leader_id != self._id
+            self._leader_id = request.leader_id
         else:
             # only other option is request.term > self.term
             # in that case the leader has changed, if we are not already a follower, we need to become one
@@ -243,9 +286,9 @@ class RaftNode:
         # reply false if log doesn't contain an entry at prev_log_index
         # whose term matches prev_log_term
         if request.prev_log_index > 0:
-            prev_log_index_log = self.state.get_log_at(request.prev_log_index)
+            prev_log_index_log = self._state.get_log_at(request.prev_log_index)
             if prev_log_index_log is None:
-                self.logger.debug(
+                self._logger.debug(
                     f"We don't have entry at index {request.prev_log_index}!"
                     f"req last index: {request.prev_log_index};"
                     f"req last term: {request.prev_log_index};"
@@ -253,10 +296,10 @@ class RaftNode:
                 )
 
                 return raft_pb2.AppendEntriesResponse(
-                    term=self.state.current_term, success=False
+                    term=self._state.current_term, success=False
                 )
             if prev_log_index_log.term != request.prev_log_term:
-                self.logger.debug(
+                self._logger.debug(
                     "Last log not matched:"
                     f"req last index: {request.prev_log_index};"
                     f"our last index: {prev_log_index_log.index};"
@@ -264,7 +307,7 @@ class RaftNode:
                     f"our last term: {prev_log_index_log.term};"
                 )
                 return raft_pb2.AppendEntriesResponse(
-                    term=self.state.current_term, success=False
+                    term=self._state.current_term, success=False
                 )
 
         # If an existing entry conflicts with a new one (same index
@@ -273,52 +316,54 @@ class RaftNode:
         # Append any new entries not already in the log
         made_state_changes = False
         for entry in request.entries:
-            self.logger.debug(f"Processing entry with index {entry.index}")
-            existing_log = self.state.get_log_at(entry.index)
+            self._logger.debug(f"Processing entry with index {entry.index}")
+            existing_log = self._state.get_log_at(entry.index)
 
             if existing_log is not None:
                 if existing_log.term != entry.term:
-                    self.logger.debug(f"Clearing from {entry.index}; term mismatch")
-                    self.state.clear_log_from(entry.index)
-                    self.logger.debug(f"new log len {self.state.get_log_len()}")
+                    self._logger.debug(f"Clearing from {entry.index}; term mismatch")
+                    self._state.clear_log_from(entry.index)
+                    self._logger.debug(f"new log len {self._state.get_log_len()}")
                     made_state_changes = True
                 else:
-                    self.logger.debug(f"We already have this entry")
+                    self._logger.debug(f"We already have this entry")
             else:
                 assert (
-                    self.state.get_log_len() + 1 == entry.index
+                    self._state.get_log_len() + 1 == entry.index
                 ), "Index not matching up"
-                self.logger.debug(f"Appending entry at {entry.index}")
-                self.state.append_log(entry)
+                self._logger.debug(f"Appending entry at {entry.index}")
+                self._state.append_log(entry)
                 made_state_changes = True
 
         if made_state_changes:
-            self.state.save()
+            self._state.save()
 
         # If leader_commit > commit_index, set commit_index =
         # min(leader_commit, index of last new entry)
-        if request.leader_commit > self.commit_index:
-            self.commit_index = min(request.leader_commit, self.state.get_log_len())
+        if request.leader_commit > self._commit_index:
+            new_commit_index = min(request.leader_commit, self._state.get_log_len())
+            if new_commit_index > self._commit_index:
+                self._req_queue.put(CommitLogs(new_commit_index))
 
         return raft_pb2.AppendEntriesResponse(
-            term=self.state.current_term, success=True
+            term=self._state.current_term, success=True
         )
 
     def _handle_request_vote_request(
         self, request: raft_pb2.RequestVoteRequest
     ) -> raft_pb2.RequestVoteResponse:
         # Reply false if term < currentTerm
-        if request.term < self.state.current_term:
-            self.logger.debug(
-                f"Candidate has lower term: ours {self.state.current_term} theirs {request.term}"
+        if request.term < self._state.current_term:
+            self._logger.debug(
+                f"Candidate has lower term: ours {self._state.current_term} theirs {request.term}"
             )
             return raft_pb2.RequestVoteResponse(
-                term=self.state.current_term, vote_granted=False
+                term=self._state.current_term, vote_granted=False
             )
 
-        if request.term > self.state.current_term:
-            self.logger.debug(
-                f"Candidate has higher term: ours {self.state.current_term} theirs {request.term}"
+        if request.term > self._state.current_term:
+            self._logger.debug(
+                f"Candidate has higher term: ours {self._state.current_term} theirs {request.term}"
             )
             self._set_new_term(request.term, None)
 
@@ -326,26 +371,26 @@ class RaftNode:
         # least as up-to-date as receiver's log, grant vote (§5.2, §5.4)
 
         vote_granted = False
-        if self.state.voted_for is None:
+        if self._state.voted_for is None:
             candidate_log_up_to_date = self._check_if_candidate_log_is_up_to_date(
                 request.last_log_index, request.last_log_term
             )
 
             if candidate_log_up_to_date:
-                self.logger.debug("Candidate log up to date - providing vote")
+                self._logger.debug("Candidate log up to date - providing vote")
                 self._set_voted_for(request.candidate_id)
                 vote_granted = True
             else:
-                self.logger.debug("Candidate log not up to date")
+                self._logger.debug("Candidate log not up to date")
         else:
-            self.logger.debug("Already voted this term")
+            self._logger.debug("Already voted this term")
 
         if vote_granted:
-            self.logger.debug(f"Voting for {self.state.voted_for}")
+            self._logger.debug(f"Voting for {self._state.voted_for}")
             self._reset_timeout()
 
         return raft_pb2.RequestVoteResponse(
-            term=self.state.current_term, vote_granted=vote_granted
+            term=self._state.current_term, vote_granted=vote_granted
         )
 
     def _check_if_candidate_log_is_up_to_date(
@@ -358,67 +403,64 @@ class RaftNode:
         end with the same term, then whichever log is longer is
         more up-to-date."""
         return (
-            (last_log := self.state.get_last_log()) is None
+            (last_log := self._state.get_last_log()) is None
             or candidate_last_log_term > last_log.term
             or candidate_last_log_term == last_log.term
             and candidate_last_log_index >= last_log.index
         )
+
+    def _commit_logs(self, action: CommitLogs) -> None:
+        """Commits a logs by applying them to the FSM and setting the corresponding event"""
+        if self._commit_index >= action.commit_index:
+            return
+
+        for i in range(self._commit_index + 1, action.commit_index + 1):
+            log = self._state.get_log_at(i)
+            assert log is not None
+            res = self._fsm.apply(log.command)
+
+            """As leader, client requests are waiting for this. Set event"""
+            try:
+                event = self._log_events.pop(i)
+                self._event_to_append_log_response[event] = AppendLogResponse(
+                    True, None, res
+                )
+                event.set()
+            except KeyError:
+                pass
+
+        self._commit_index = action.commit_index
 
     # endregion
 
     # region Candidate
 
     def _run_election(self) -> None:
-        self._set_new_term(self.state.current_term + 1, self.id)
-        election_data = ElectionData(self.state.current_term)
-        election_data.votes_received = 1  # we voted for ourself
+        self._set_new_term(self._state.current_term + 1, self._id)
+        self._send_request_vote_to_members()
 
-        self._send_request_vote_to_members_and_handle_responses(election_data)
-        if election_data.votes_received >= self._get_quorum_val():
-            self._role = "L"
-
-    def _send_request_vote_to_members_and_handle_responses(self, election_data) -> None:
-        """This takes care of sending out the vote requests and counting them up"""
-
-        def wrapped_request(member_id: int, request):
-            if response := self._send_request_vote_request(member_id, request):
-                return member_id, response
-            else:
-                return None
-
+    def _send_request_vote_to_members(self) -> None:
+        """This takes care of sending out vote requests"""
         request = self._create_request_vote_request()
-        with ThreadPoolExecutor(len(self._members)) as t_pool:
-            futures = []
-            for member_id in self._members:
-                if member_id == self.id:
-                    continue
-
-                futures.append(
-                    t_pool.submit(
-                        wrapped_request,
-                        member_id,
-                        request,
-                    )
-                )
-
-            for future in as_completed(futures):
-                if result := future.result():
-                    member_id, response = result
-                    self._handle_request_vote_response(
-                        election_data, member_id, response
-                    )
+        for member_id in self._members:
+            if member_id == self._id:
+                continue
+            threading.Thread(
+                target=self._send_request_vote_request,
+                args=(member_id, request),
+            ).start()
 
     def _create_request_vote_request(self) -> raft_pb2.RequestVoteRequest:
         last_log_index = 0
         last_log_term = 0
 
-        if last_log := self.state.get_last_log():
+        if last_log := self._state.get_last_log():
             last_log_index = last_log.index
             last_log_term = last_log.term
 
         return raft_pb2.RequestVoteRequest(
-            term=self.state.current_term,
-            candidate_id=self.id,
+            term=self._state.current_term,
+            candidate_id=self._id,
             last_log_index=last_log_index,
             last_log_term=last_log_term,
         )
@@ -427,12 +469,14 @@ class RaftNode:
         self,
         member_id: int,
         request: raft_pb2.RequestVoteRequest,
-    ) -> Optional[raft_pb2.RequestVoteResponse]:
+    ) -> None:
         try:
-            return self._transport.send_request_vote(member_id, request)
+            response = self._transport.send_request_vote(member_id, request)
         except Exception as ex:
-            self.logger.debug(f"Failed to send request to {member_id}: {ex}")
-            return None
+            self._logger.debug(f"Failed to send request to {member_id}: {ex}")
+            return
+        else:
+            self._req_queue.put(RequestVoteResponse(member_id, response))
 
     def _handle_request_vote_response(
         self,
@@ -448,30 +492,34 @@ class RaftNode:
         if response.vote_granted and member_id not in election_data.voters:
             election_data.voters.add(member_id)
             election_data.votes_received += 1
+            if election_data.votes_received >= self._get_quorum_val():
+                self._role = "L"
 
     # endregion Candidate
 
     # region Leader
 
-    def _heartbeat_thread(self) -> None:
+    def _run_heartbeat_loop(self) -> None:
         """Adds a SendHeartbeat req to the queue at a constant interval for the main thread to process"""
+        heartbeat_interval_sec = self._heartbeat_interval_ms / 1000
         while self._role == "L":
-            curr_time = time.time()
-            heartbeat_interval_sec = 0.5
+            curr_time = time.perf_counter()
             next_time = curr_time + heartbeat_interval_sec
             self._req_queue.put(SendHeartbeat())
-            time.sleep(max((next_time - time.time()), 0))
+            time.sleep(max((next_time - time.perf_counter()), 0))
 
     def _initialize_leader(self) -> None:
-        next = self.state.get_log_len() + 1
+        self._leader_id = self._id
+
+        next = self._state.get_log_len() + 1
         for member_id in self._members:
-            self.leader_state.match_index[member_id] = 0
-            self.leader_state.next_index[member_id] = next
+            self._leader_state.match_index[member_id] = 0
+            self._leader_state.next_index[member_id] = next
 
-        assert self.heart_beat_task is None
+        assert self._heartbeat_thread is None
 
-        self.heart_beat_task = threading.Thread(target=self._heartbeat_thread)
-        self.heart_beat_task.start()
+        self._heartbeat_thread = threading.Thread(target=self._run_heartbeat_loop)
+        self._heartbeat_thread.start()
 
     def _send_append_entries_to_followers(self) -> None:
         assert self._role == "L"
@@ -487,41 +535,42 @@ class RaftNode:
     ) -> List[Tuple[int, int, raft_pb2.AppendEntriesRequest]]:
         requests: List[Tuple[int, int, raft_pb2.AppendEntriesRequest]] = []
         for member_id in self._members:
-            if member_id == self.id:
+            if member_id == self._id:
                 continue
 
-            next_index = self.leader_state.next_index[member_id]
+            next_index = self._leader_state.next_index[member_id]
 
-            self.logger.debug(f"Creating append entries request for {member_id}")
+            self._logger.debug(f"Creating append entries request for {member_id}")
             append_entries_request = self._create_append_entries_request(
-                self.state.current_term, next_index
+                self._state.current_term, next_index
             )
             sent_index = next_index + len(append_entries_request.entries) - 1
             requests.append((member_id, sent_index, append_entries_request))
+
         return requests
 
     def _create_append_entries_request(
         self, term: int, next_index: int
     ) -> raft_pb2.AppendEntriesRequest:
         prev_log_index = next_index - 1
-        prev_log_term = self.state.get_log_term_at(prev_log_index)
-        entries = self.state.get_logs_starting_from(next_index, max=10)
-        self.logger.debug(
+        prev_log_term = self._state.get_log_term_at(prev_log_index)
+        entries = self._state.get_logs_starting_from(next_index, max=10)
+        self._logger.debug(
             "AppendRequest:"
             f"term={term};"
-            f"id={self.id};"
+            f"id={self._id};"
             f"prev_index={prev_log_index};"
             f"prev_term={prev_log_term};"
             f"entries_len={len(entries)};"
-            f"leader_commit={self.commit_index};"
+            f"leader_commit={self._commit_index};"
         )
         return raft_pb2.AppendEntriesRequest(
             term=term,
-            leader_id=self.id,
+            leader_id=self._id,
             prev_log_index=prev_log_index,
             prev_log_term=prev_log_term,
             entries=entries,
-            leader_commit=self.commit_index,
+            leader_commit=self._commit_index,
         )
 
     def _send_append_entries_request(
@@ -531,9 +580,11 @@ class RaftNode:
         append_entries_request: raft_pb2.AppendEntriesRequest,
     ) -> None:
         try:
-            response = self._transport.send_append_entries(member_id, append_entries_request)
+            response = self._transport.send_append_entries(
+                member_id, append_entries_request
+            )
         except Exception as ex:
-            self.logger.debug(f"Failed to send request to {member_id}: {ex}")
+            self._logger.debug(f"Failed to send request to {member_id}: {ex}")
         else:
             self._req_queue.put(AppendEntriesResponse(member_id, sent_index, response))
 
@@ -544,7 +595,7 @@ class RaftNode:
         response: raft_pb2.AppendEntriesResponse,
     ) -> None:
         """Used by leader"""
-        if response.term > self.state.current_term:
+        if response.term > self._state.current_term:
             self._set_new_term(response.term, None)
             return
 
@@ -552,61 +603,80 @@ class RaftNode:
             return
 
         # handle old responses
-        if sent_index < self.leader_state.match_index[member_id]:
+        if sent_index < self._leader_state.match_index[member_id]:
             return
 
         if response.success:
             # If successful: update nextIndex and matchIndex for
             # follower (§5.3)
-            self.logger.debug(f"Response from {member_id} success")
-            self.leader_state.next_index[member_id] = sent_index + 1
-            self.leader_state.match_index[member_id] = sent_index
+            self._logger.debug(f"Response from {member_id} success")
+            self._leader_state.next_index[member_id] = sent_index + 1
+            self._leader_state.match_index[member_id] = sent_index
         else:
-            self.logger.debug(
+            self._logger.debug(
                 f"Response from {member_id} indicates fail; decrementing next"
             )
             # decrement next_index so we can try to get them up to speed
-            self.leader_state.next_index[member_id] = max(
-                self.leader_state.next_index[member_id] - 1, 1
+            self._leader_state.next_index[member_id] = max(
+                self._leader_state.next_index[member_id] - 1, 1
             )
 
     def _calculate_commit_index(self) -> int:
         # Find the highest log index replicated on a majority of servers
         sorted_match_indexes = sorted(
-            self.leader_state.match_index.values(), reverse=True
+            self._leader_state.match_index.values(), reverse=True
         )
         commit_index = sorted_match_indexes[self._get_quorum_val() - 1]
         return commit_index
 
-    # endregion Leader
-
-    # region main processing thread
-
-    def start_raft_processing(self) -> None:
-        self.logger.warning(f"Start raft process for node {self.id}")
-        if self._processing_thread is None:
-            self._processing_thread = threading.Thread(target=self._base_loop)
-            self._processing_thread.start()
-
-    def stop_raft_processing(self) -> None:
-        if self._processing_thread is None:
+    def _append_log(self, action: AppendLog) -> None:
+        if self._role != "L":
+            self._logger.debug("We are not leader; notify client")
+            self._event_to_append_log_response[action.event] = AppendLogResponse(
+                False, self._leader_id, None
+            )
+            action.event.set()
             return
 
-        self._req_queue.put(Shutdown())
+        self._logger.debug("We are leader; append log and add event")
+        index = self._state.get_log_len() + 1
+        self._logger.debug(f"Adding log to index {index}")
+        self._state.append_log(
+            raft_pb2.LogEntry(
+                index=index, term=self._state.current_term, command=action.command
+            )
+        )
+        # store event so that we can set it once log is committed
+        self._log_events[index] = action.event
 
-        self._processing_thread.join()
-        self._processing_thread = None
+        # update match index for ourself
+        self._leader_state.match_index[self._id] = index
+
+    # endregion Leader
+
+    # region Processing
+
+    """This section is """
 
     def _base_loop(self) -> None:
         self._reset_timeout()
+        self._start_timeout_thread()
+
         while True:  # might want to add some condition here
             if self._role == "F":
+                self._logger.debug("Role Change: Follower")
                 self._follower_loop()
             elif self._role == "C":
+                self._logger.debug("Role Change: Candidate")
+                self._candidate_setup()
                 self._candidate_loop()
             elif self._role == "L":
+                self._logger.debug("Role Change: Leader")
+                self._leader_setup()
                 self._leader_loop()
             elif self._role == "S":
+                self._logger.debug("Role Change: Shutdown")
+                self._shutdown_setup()
                 self._shutdown_loop()
                 return
             else:
@@ -614,222 +684,229 @@ class RaftNode:
 
     def _handle_default_actions(self, action: Action) -> None:
         if isinstance(action, AppendEntriesResponse):
-            self.logger.debug("Processing append entries response")
+            self._logger.debug("Processing append entries response")
             self._handle_append_entries_response(
                 action.member_id, action.sent_index, action.response
             )
 
         elif isinstance(action, AppendEntriesRequest):
-            self.logger.debug("Processing append entries request")
+            self._logger.debug("Processing append entries request")
             append_res = self._handle_append_entries_request(action.request)
             self._event_to_append_entries_response[action.event] = append_res
             action.event.set()
 
         elif isinstance(action, AppendLog):
-            self.logger.debug("Processing append log")
+            self._logger.debug("Processing append log")
             self._append_log(action)
 
         elif isinstance(action, CommitLogs):
-            self.logger.debug("Processing commit logs")
+            self._logger.debug("Processing commit logs")
             self._commit_logs(action)
 
         elif isinstance(action, RequestVoteRequest):
-            self.logger.debug("Processing request vote request")
+            self._logger.debug("Processing request vote request")
             vote_res = self._handle_request_vote_request(action.request)
             self._event_to_request_vote_response[action.event] = vote_res
             action.event.set()
 
         elif isinstance(action, SendHeartbeat):
-            self.logger.debug("Processing send heartbeat")
+            self._logger.debug("Processing send heartbeat")
             if self._role == "L":
                 commit_index = self._calculate_commit_index()
-                if commit_index > self.commit_index:
-                    self.logger.debug("commit index changed")
+                if commit_index > self._commit_index:
+                    self._logger.debug("commit index changed")
                     self._req_queue.put(CommitLogs(commit_index))
                 self._send_append_entries_to_followers()
 
         elif isinstance(action, Shutdown):
-            self.logger.debug("Processing shutdown")
+            self._logger.debug("Processing shutdown")
             self._role = "S"
 
         else:
-            self.logger.debug(f"Invalid or unhandled action provided: '{action}'")
-
-    def _append_log(self, action: AppendLog) -> None:
-        if self._role != "L":
-            self.logger.debug("We are not leader; notify client")
-            self._event_to_append_log_response[action.event] = AppendLogResponse(
-                False, self.leader_id, None
-            )
-            action.event.set()
-            return
-
-        self.logger.debug("We are leader; append log and add event")
-        index = self.state.get_log_len() + 1
-        self.logger.debug(f"Adding log to index {index}")
-        self.state.append_log(
-            raft_pb2.LogEntry(
-                index=index, term=self.state.current_term, command=action.command
-            )
-        )
-        self._log_events[index] = action.event
-
-    def _commit_logs(self, action: CommitLogs) -> None:
-        if self.commit_index >= action.commit_index:
-            return
-
-        for i in range(self.commit_index + 1, action.commit_index + 1):
-            log = self.state.get_log_at(i)
-            assert log is not None
-            res = self._fsm.apply(log.command)
-
-            if self._role == "L":
-                """As leader, client requests are waiting for this. Set event"""
-                try:
-                    event = self._log_events.pop(i)
-                    self._event_to_append_log_response[event] = AppendLogResponse(
-                        True, None, res
-                    )
-                    event.set()
-                except KeyError:
-                    pass
-
-        self.commit_index = action.commit_index
+            self._logger.debug(f"Invalid or unhandled action provided: '{action}'")
 
     def _follower_loop(self) -> None:
-        self.logger.debug("Role Change: Follower")
-
         while self._role == "F":
             try:
                 # adding timeout here just in case
-                action = self._req_queue.get(timeout=1)
+                action = self._req_queue.get(timeout=0.1)
             except queue.Empty:
-                self.logger.debug("Queue empty")
+                self._logger.debug("Queue empty")
                 continue
 
             if isinstance(action, Timeout):
-                self.logger.debug("Processing timeout")
+                self._logger.debug("Processing timeout")
                 # start election process
                 self._role = "C"
                 return
 
-            self._handle_default_actions(action)
+            if isinstance(action, RequestVoteResponse):
+                pass
+            else:
+                self._handle_default_actions(action)
 
-    def _candidate_loop(self) -> None:
-        self.logger.debug("Role Change: Candidate")
+            self._req_queue.task_done()
+
+    def _candidate_setup(self) -> None:
+        self._run_election()
 
         self._reset_timeout()
+        self._start_timeout_thread()
 
-        self._run_election()
-        # if we got enough votes and became leader, exit, otherwise do loop below
-        if self._role == "L":
-            return
-
+    def _candidate_loop(self) -> None:
+        election_data = ElectionData(self._state.current_term)
+        election_data.votes_received = 1  # vote for ourself
         while self._role == "C":
             try:
                 # adding timeout here just in case
-                self.logger.debug("Waiting for queue req")
-                action = self._req_queue.get(timeout=1)
+                self._logger.debug("Waiting for queue req")
+                action = self._req_queue.get(timeout=0.1)
             except queue.Empty:
-                self.logger.debug("Queue empty")
+                self._logger.debug("Queue empty")
                 continue
 
             if isinstance(action, Timeout):
-                self.logger.debug("Processing timeout")
+                self._logger.debug("Processing timeout")
                 # restart election process
                 return
 
-            self._handle_default_actions(action)
+            if isinstance(action, RequestVoteResponse):
+                self._handle_request_vote_response(
+                    election_data, action.member_id, action.response
+                )
+            else:
+                self._handle_default_actions(action)
 
-    def _leader_loop(self) -> None:
-        self.logger.debug("Role Change: Leader")
+            self._req_queue.task_done()
 
+    def _leader_setup(self) -> None:
         self._cancel_timeout()
         self._initialize_leader()
 
+    def _leader_loop(self) -> None:
         while self._role == "L":
             try:
                 # adding timeout here just in case
-                self.logger.debug("Waiting for queue req")
-                action = self._req_queue.get(timeout=1)
+                self._logger.debug("Waiting for queue req")
+                action = self._req_queue.get(timeout=0.1)
             except queue.Empty:
-                self.logger.debug("Queue empty")
+                self._logger.debug("Queue empty")
                 continue
 
             if isinstance(action, Timeout):
-                self.logger.debug("Processing timeout")
-                # ignore timeouts
-                continue
+                pass
+            if isinstance(action, RequestVoteResponse):
+                pass
+            else:
+                self._handle_default_actions(action)
 
-            self._handle_default_actions(action)
+            self._req_queue.task_done()
 
-        self.heart_beat_task.join()  # type: ignore
-        self.heart_beat_task = None
+        self._heartbeat_thread.join()  # type: ignore
+        self._heartbeat_thread = None
+
+    def _shutdown_setup(self) -> None:
+        self._cancel_timeout()
+        if self._timeout_thread:
+            self._timeout_thread.join()
+
+        self._role = "S"
+        if self._heartbeat_thread:
+            self._heartbeat_thread.join()
 
     def _shutdown_loop(self) -> None:
-        self.logger.debug("Role: Shutdown")
-        self._cancel_timeout()
-        self._heartbeat_thread()
-
         while True:
             try:
                 # adding timeout here just in case
-                self.logger.debug("Waiting for queue req")
+                self._logger.debug("Waiting for queue req")
                 action = self._req_queue.get(block=False)
             except queue.Empty:
-                self.logger.debug("Queue empty")
-                return
+                self._logger.debug("Queue empty")
+                break
 
             if isinstance(action, Timeout):
-                continue
-
-            if isinstance(action, AppendLog):
+                pass
+            elif isinstance(action, AppendLog):
                 res = AppendLogResponse(False, None, None)
                 self._event_to_append_log_response[action.event] = res
                 action.event.set()
                 continue
+            elif isinstance(action, RequestVoteResponse):
+                pass
+            else:
+                self._handle_default_actions(action)
 
-            self._handle_default_actions(action)
+            self._req_queue.task_done()
+
+        # clear all pending events
+        for e in self._event_to_append_entries_response:
+            e.set()
+        for e in self._event_to_append_log_response:
+            e.set()
+        for e in self._event_to_request_vote_response:
+            e.set()
+        for log_index in self._log_events:
+            self._log_events[log_index].set()
+
+    # endregion
+
+    # region Timeout
+
+    def _start_timeout_thread(self) -> None:
+        self._timeout_thread_should_run = True
+        self._timeout_thread = threading.Thread(
+            target=self._timeout_checker, daemon=True
+        )
+        self._timeout_thread.start()
+
+    def _reset_timeout(self) -> None:
+        self._logger.debug("Resetting timeout")
+
+        election_timeout_ms = random.randint(self._timeout_min_ms, self._timeout_max_ms)
+        self._timeout_deadline = time.perf_counter() + (election_timeout_ms / 1000)
+        self._logger.debug(f"Next timeout in {election_timeout_ms} ms")
+
+    def _cancel_timeout(self) -> None:
+        self._timeout_deadline = None
+        self._timeout_thread_should_run = False
+        self._timeout_thread = None
+
+    def _timeout_checker(self):
+        while self._timeout_thread_should_run:
+            time.sleep(0.05)
+            if (
+                self._timeout_deadline is not None
+                and time.perf_counter() >= self._timeout_deadline
+            ):
+                self._timeout_handler()
+                break
+
+    def _timeout_handler(self) -> None:
+        self._logger.warning("Timeout hit!")
+        self._req_queue.put(Timeout())
 
     # endregion
 
     # region Misc
 
-    def _reset_timeout(self) -> None:
-        self.logger.debug("Restarting timeout")
-        self._cancel_timeout()
-
-        election_timeout_ms: int = random.randint(
-            self.timeout_min_ms, self.timeout_max_ms
-        )
-        self.logger.debug(f"Next timeout in {election_timeout_ms} ms")
-        self.timeout_task = threading.Timer(
-            election_timeout_ms / 1000, self._timeout_handler
-        )
-        self.timeout_task.start()
-
-    def _cancel_timeout(self) -> None:
-        if self.timeout_task:
-            self.timeout_task.cancel()
-
-    def _timeout_handler(self) -> None:
-        self.logger.warning("Timeout hit!")
-        self._req_queue.put(Timeout())
+    def _check_running(self) -> None:
+        if not self._accepting_actions or not self._processing_thread:
+            raise RuntimeError("Server not running")
 
     def _set_new_term(
         self, new_term: int, voted_for: Optional[int], leader_id: Optional[int] = None
     ) -> None:
-        if new_term > self.state.current_term:
-            self.logger.debug(f"Setting new term {new_term}")
-            self.state.set_new_term(new_term, voted_for)
-            self._role = "C" if voted_for == self.id else "F"
-            self.leader_id = leader_id
+        if new_term > self._state.current_term:
+            self._logger.debug(f"Setting new term {new_term}")
+            self._state.set_new_term(new_term, voted_for)
+            self._role = "C" if voted_for == self._id else "F"
+            self._leader_id = leader_id
 
     def _get_quorum_val(self) -> int:
         """The number of votes required to reach majority"""
         return math.floor(len(self._members) / 2) + 1
 
     def _set_voted_for(self, candidate_id: int):
-        self.state.set_voted_for(candidate_id)
+        self._state.set_voted_for(candidate_id)
 
     # endregion Misc

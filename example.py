@@ -1,6 +1,8 @@
-from raft import RaftNode, LocalTransport, PersistentState, AppendLogResponse
-from typing import Dict, Optional
 import dataclasses
+from typing import Dict, Optional
+
+from raft import AppendLogResponse, LocalTransport, PersistentState, RaftNode
+
 
 class ServerStateMachine:
     def __init__(self):
@@ -10,12 +12,20 @@ class ServerStateMachine:
         self.sum += int(command)
         return self.sum
 
+    def reset(self) -> None:
+        self.sum = 0
+
+
 @dataclasses.dataclass
 class NodeInfo:
     transport: LocalTransport
+    fsm: ServerStateMachine
     node: RaftNode
 
-def try_send(leader_id: Optional[int], members: Dict[int, NodeInfo], command: str) -> Optional[AppendLogResponse]:
+
+def try_send(
+    leader_id: Optional[int], members: Dict[int, NodeInfo], command: str
+) -> Optional[AppendLogResponse]:
     for i in members.keys():
         if leader_id is None:
             leader_id = i
@@ -24,6 +34,8 @@ def try_send(leader_id: Optional[int], members: Dict[int, NodeInfo], command: st
         except RuntimeError as ex:
             leader_id = None
             print(ex)
+            continue
+
         if res.success:
             return res
 
@@ -31,6 +43,7 @@ def try_send(leader_id: Optional[int], members: Dict[int, NodeInfo], command: st
             leader_id = res.leader
 
     return None
+
 
 def process_user_commands(members: Dict[int, NodeInfo]) -> None:
     while True:
@@ -59,7 +72,7 @@ def process_user_commands(members: Dict[int, NodeInfo]) -> None:
             except ValueError:
                 print("That's not a valid number")
                 continue
-            
+
             node_info = members[node_id]
             print(f"Stopping node with id {node_id}")
             node_info.node.stop_raft_processing()
@@ -72,11 +85,11 @@ def process_user_commands(members: Dict[int, NodeInfo]) -> None:
             except ValueError:
                 print("That's not a valid number")
                 continue
-            
+
             node_info = members[node_id]
             print(f"Starting node with id {node_id}")
             node_info.node.start_raft_processing()
-            print(f"Node stopped")
+            print(f"Node started")
 
         elif user_input == "leader id":
             for i in members:
@@ -85,6 +98,14 @@ def process_user_commands(members: Dict[int, NodeInfo]) -> None:
                 except Exception as ex:
                     print(ex)
 
+        elif user_input == "fsm values":
+            for i in members:
+                print(f"node {i} fsm value is {members[i].fsm.sum}")
+
+        elif user_input == "commit indices":
+            for i in members:
+                print(f"node {i} commit index is {members[i].node._commit_index}")
+
         elif user_input == "timeout":
             user_input = input("Enter node id:")
             try:
@@ -92,12 +113,13 @@ def process_user_commands(members: Dict[int, NodeInfo]) -> None:
             except ValueError:
                 print("That's not a valid number")
                 continue
-            
+
             node_info = members[node_id]
             try:
                 node_info.node.force_timeout()
             except RuntimeError as ex:
                 print(ex)
+
 
 def main() -> None:
     member_ids = [1, 2, 3]
@@ -107,7 +129,7 @@ def main() -> None:
         transport = LocalTransport()
         fsm = ServerStateMachine()
         raft_node = RaftNode(id, state, transport, member_ids, fsm)
-        members[id] = NodeInfo(transport, raft_node)
+        members[id] = NodeInfo(transport, fsm, raft_node)
 
     # add local transport for all members
     for member_id, node_info in members.items():
@@ -123,9 +145,12 @@ def main() -> None:
     try:
         process_user_commands(members)
     except (KeyboardInterrupt, EOFError):
-        print("Stopping raft processing")
-        for member_id, node_info in members.items():
-            node_info.node.stop_raft_processing()
+        pass
+
+    print("Stopping raft processing")
+    for member_id, node_info in members.items():
+        node_info.node.stop_raft_processing()
+
 
 if __name__ == "__main__":
     main()
