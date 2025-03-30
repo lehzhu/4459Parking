@@ -6,7 +6,8 @@ from raft import raft_pb2, raft_pb2_grpc
 
 
 class GrpcTransport:
-    def __init__(self, members: Dict[int, str]):
+    def __init__(self, own_id: int, members: Dict[int, str]):
+        self._id = own_id
         self._members = members
         self._member_channels: Dict[int, grpc.Channel] = {}
         self._member_stubs: Dict[int, raft_pb2_grpc.RaftStub] = {}
@@ -23,8 +24,10 @@ class GrpcTransport:
         member_stub = self._member_stubs[member_id]
         return member_stub.RequestVote(request)
 
-    def _create_member_stubs(self) -> None:
+    def create_member_stubs(self) -> None:
         for member_id, member_address in self._members.items():
+            if self._id == member_id:
+                continue
             if self._member_stubs.get(member_id) is not None:
                 continue
 
@@ -35,7 +38,7 @@ class GrpcTransport:
 
             self._member_stubs[member_id] = raft_pb2_grpc.RaftStub(channel)
 
-    def _close_member_stubs(self) -> None:
+    def close_member_stubs(self) -> None:
         for member_channel in self._member_channels.values():
             member_channel.close()
 
