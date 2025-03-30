@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+service Raft {
+    // Invoked by candidates to gather votes
+    rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+    
+    // Invoked by leader to replicate log entries; also used as heartbeat
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+    
+    // For video processor: forward a frame to the leader
+    rpc ForwardVideoFrame(VideoFrameForward) returns (ForwardResponse);
+}
+
+// Request vote RPC arguments
+message RequestVoteRequest {
+    // candidate's term
+    int32 term = 1;
+    
+    // candidate requesting vote
+    int32 candidate_id = 2;
+    
+    // index of candidate's last log entry
+    int32 last_log_index = 3;
+    
+    // term of candidate's last log entry
+    int32 last_log_term = 4;
+}
+
+// Request vote RPC results
+message RequestVoteResponse {
+    // current term, for candidate to update itself
+    int32 term = 1;
+    
+    // true means candidate received vote
+    bool vote_granted = 2;
+}
+
+// Append entries RPC arguments
+message AppendEntriesRequest {
+    // leader's term
+    int32 term = 1;
+    
+    // so follower can redirect clients
+    int32 leader_id = 2;
+    
+    // index of log entry immediately preceding new ones
+    int32 prev_log_index = 3;
+    
+    // term of prev_log_index entry
+    int32 prev_log_term = 4;
+    
+    // log entries to store (empty for heartbeat)
+    repeated LogEntry entries = 5;
+    
+    // leader's commit_index
+    int32 leader_commit = 6;
+}
+
+// Append entries RPC results
+message AppendEntriesResponse {
+    // current term, for leader to update itself
+    int32 term = 1;
+    
+    // true if follower contained entry matching prev_log_index and prev_log_term
+    bool success = 2;
+}
+
+// Video frame forwarding request
+message VideoFrameForward {
+    // Sender's term
+    int32 term = 1;
+    
+    // Sender's ID
+    int32 sender_id = 2;
+    
+    // The frame data
+    int32 frame_number = 3;
+    bytes data = 4;
+    int64 timestamp = 5;
+}
+
+// Forward response
+message ForwardResponse {
+    // Current term for sender to update itself
+    int32 term = 1;
+    
+    // True if frame was processed successfully
+    bool success = 2;
+    
+    // Optional message
+    string message = 3;
+}
+
+// Log entry
+message LogEntry {
+    int32 index = 1;
+    int32 term = 2;
+    bytes command = 3;
+} 
