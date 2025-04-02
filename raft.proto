@@ -9,6 +9,9 @@ service Raft {
     
     // For video processor: forward a frame to the leader
     rpc ForwardVideoFrame(VideoFrameForward) returns (ForwardResponse);
+    
+    // Heartbeat method for service health checks
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 
 // Request vote RPC arguments
@@ -96,4 +99,17 @@ message LogEntry {
     int32 index = 1;
     int32 term = 2;
     bytes command = 3;
+}
+
+// Heartbeat request
+message HeartbeatRequest {
+    int32 node_id = 1;
+    string service_name = 2;
+    string status = 3;
+}
+
+// Heartbeat response
+message HeartbeatResponse {
+    bool success = 1;
+    string message = 2;
 } 
