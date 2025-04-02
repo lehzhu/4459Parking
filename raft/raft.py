@@ -135,9 +135,7 @@ class RaftNode:
     def _initialize(self) -> None:
         self._heartbeat_thread: Optional[threading.Thread] = None
 
-        self._timeout_thread: Optional[threading.Thread] = None
         self._timeout_deadline: Optional[float] = None
-        self._timeout_thread_should_run: bool = False
 
         self._leader_id: Optional[int] = None
         """ID of the current known leader"""
@@ -660,7 +658,6 @@ class RaftNode:
 
     def _base_loop(self) -> None:
         self._reset_timeout()
-        self._start_timeout_thread()
 
         while True:  # might want to add some condition here
             if self._role == "F":
@@ -726,13 +723,13 @@ class RaftNode:
             self._logger.debug(f"Invalid or unhandled action provided: '{action}'")
 
     def _follower_loop(self) -> None:
+        assert self._timeout_deadline is not None
         while self._role == "F":
             try:
-                # adding timeout here just in case
-                action = self._req_queue.get(timeout=0.1)
-            except queue.Empty:
-                self._logger.debug("Queue empty")
-                continue
+                action = self._req_queue.get(timeout=self._timeout_deadline - time.perf_counter())
+            except (queue.Empty, ValueError):  # value error is raised when timeout is negative
+                self._logger.warning("Timeout hit!")
+                action = Timeout()
 
             if isinstance(action, Timeout):
                 self._logger.debug("Processing timeout")
@@ -749,26 +746,23 @@ class RaftNode:
 
     def _candidate_setup(self) -> None:
         self._run_election()
-
         self._reset_timeout()
-        self._start_timeout_thread()
 
     def _candidate_loop(self) -> None:
         election_data = ElectionData(self._state.current_term)
         election_data.votes_received = 1  # vote for ourself
+        assert self._timeout_deadline is not None
         while self._role == "C":
             try:
-                # adding timeout here just in case
-                self._logger.debug("Waiting for queue req")
-                action = self._req_queue.get(timeout=0.1)
-            except queue.Empty:
-                self._logger.debug("Queue empty")
-                continue
+                action = self._req_queue.get(timeout=self._timeout_deadline - time.perf_counter())
+            except (queue.Empty, ValueError):
+                self._logger.warning("Timeout hit!")
+                action = Timeout()
 
             if isinstance(action, Timeout):
                 self._logger.debug("Processing timeout")
                 # restart election process
-                return
+                break
 
             if isinstance(action, RequestVoteResponse):
                 self._handle_request_vote_response(
@@ -785,13 +779,7 @@ class RaftNode:
 
     def _leader_loop(self) -> None:
         while self._role == "L":
-            try:
-                # adding timeout here just in case
-                self._logger.debug("Waiting for queue req")
-                action = self._req_queue.get(timeout=0.1)
-            except queue.Empty:
-                self._logger.debug("Queue empty")
-                continue
+            action = self._req_queue.get()
 
             if isinstance(action, Timeout):
                 pass
@@ -804,11 +792,10 @@ class RaftNode:
 
         self._heartbeat_thread.join()  # type: ignore
         self._heartbeat_thread = None
+        self._reset_timeout()
 
     def _shutdown_setup(self) -> None:
         self._cancel_timeout()
-        if self._timeout_thread:
-            self._timeout_thread.join()
 
         self._role = "S"
         if self._heartbeat_thread:
@@ -852,13 +839,6 @@ class RaftNode:
 
     # region Timeout
 
-    def _start_timeout_thread(self) -> None:
-        self._timeout_thread_should_run = True
-        self._timeout_thread = threading.Thread(
-            target=self._timeout_checker, daemon=True
-        )
-        self._timeout_thread.start()
-
     def _reset_timeout(self) -> None:
         self._logger.debug("Resetting timeout")
 
@@ -868,22 +848,6 @@ class RaftNode:
 
     def _cancel_timeout(self) -> None:
         self._timeout_deadline = None
-        self._timeout_thread_should_run = False
-        self._timeout_thread = None
-
-    def _timeout_checker(self):
-        while self._timeout_thread_should_run:
-            time.sleep(0.05)
-            if (
-                self._timeout_deadline is not None
-                and time.perf_counter() >= self._timeout_deadline
-            ):
-                self._timeout_handler()
-                break
-
-    def _timeout_handler(self) -> None:
-        self._logger.warning("Timeout hit!")
-        self._req_queue.put(Timeout())
 
     # endregion
 
