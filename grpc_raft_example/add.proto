@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+message AddRequest {
+  int32 value = 1;
+}
+
+message AddResponse {
+  bool success = 1;
+  string leader_address = 2;
+  int32 total = 3;
+}
+
+service AddService {
+  rpc Add(AddRequest) returns (AddResponse);
+}
