@@ -151,6 +151,7 @@ def process_user_commands(members: Dict[int, NodeInfo], member_addresses: Dict[i
             node_info.server = server
             add_pb2_grpc.add_AddServiceServicer_to_server(node_info.add_service, server)
             raft_pb2_grpc.add_RaftServicer_to_server(node_info.raft_service, server)
+            node_info.server.add_insecure_port(member_addresses[node_id])
             node_info.server.start()
             node_info.add_service.raft_node.start_raft_processing()
             print(f"Node started")
