@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package heartbeat;
+
+// Service definition for system health monitoring
+service ViewService {
+  // Heartbeat endpoint for services to report their status
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  
+  // Get status of all registered services
+  rpc GetServiceStatus(ServiceStatusRequest) returns (ServiceStatusResponse);
+}
+
+// Heartbeat request sent by services periodically
+message HeartbeatRequest {
+  string service_identifier = 1;  // Unique identifier for the service
+  string status = 2;              // Optional status info (OK, DEGRADED, etc.)
+  int64 timestamp = 3;            // Unix timestamp (if not provided, server will set)
+}
+
+// Response to heartbeat
+message HeartbeatResponse {
+  bool acknowledged = 1;          // Whether the heartbeat was recorded
+  string message = 2;             // Optional message from the view service
+}
+
+// Request to get status of services
+message ServiceStatusRequest {
+  repeated string service_identifiers = 1;  // Optional list of services to query
+                                           // If empty, return all services
+}
+
+// Response with service statuses
+message ServiceStatusResponse {
+  repeated ServiceStatus services = 1;      // List of service statuses
+}
+
+// Status of an individual service
+message ServiceStatus {
+  string service_identifier = 1;   // Service identifier
+  string status = 2;               // Current status
+  int64 last_heartbeat = 3;        // Timestamp of last heartbeat
+  bool is_alive = 4;               // Whether service is considered alive
+}
