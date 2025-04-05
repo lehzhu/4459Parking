@@ -16,8 +16,8 @@ import video_stream_pb2_grpc
 # Import RAFT proto definitions
 # Note: You'll need to generate these first with:
 # python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. raft.proto
-import raft_pb2
-import raft_pb2_grpc
+from raft import raft_pb2
+from raft import raft_pb2_grpc
 
 # State enum for the RAFT protocol
 class RaftState:
