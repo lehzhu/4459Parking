@@ -5,9 +5,16 @@ import video_stream_pb2_grpc
 import random
 import os
 import socket
+import argparse
 
 # Default server address
 DEFAULT_SERVER = 'localhost:60061'
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Camera Video Client')
+    parser.add_argument('--camera-id', type=int, required=True, help='Unique camera ID number')
+    parser.add_argument('--frame-interval', type=int, default=10, help='Frame interval in seconds (default: 10)')
+    return parser.parse_args()
 
 def discover_server():
     """Tries to discover the current leader in a RAFT cluster.
@@ -33,8 +40,7 @@ def discover_server():
                 )
                 stub = video_stream_pb2_grpc.VideoStreamServiceStub(channel)
                 
-                # Try a quick ping (you'd need to implement this in your service)
-                # For now, we'll just assume the first responding server is usable
+                # Try a quick ping
                 response = stub.StreamVideo(iter([generate_test_frame()]))
                 next(response, None)  # Just try to get the first response
                 
@@ -55,26 +61,28 @@ def generate_test_frame():
         timestamp=int(time.time())
     )
 
-def generate_frames():
+def generate_frames(camera_id, frame_interval):
     frame_number = 1
     while True:
-        # Simulate capturing a frame: here, 'data' is just a byte string.
-        frame_data = f"Simulated frame data for frame {frame_number}".encode('utf-8')
+        # Generate a random string for the frame data
+        random_data = f"Camera {camera_id} - Frame {frame_number} - Random: {random.randint(1000, 9999)}"
+        frame_data = random_data.encode('utf-8')
         timestamp = int(time.time())
         
         frame = video_stream_pb2.VideoFrame(
             frame_number=frame_number,
             data=frame_data,
-            timestamp=timestamp
+            timestamp=timestamp,
+            camera_id=camera_id
         )
-        print(f"Sending frame #{frame_number} at {timestamp}")
+        print(f"Camera {camera_id} sending frame #{frame_number} at {timestamp}")
         yield frame
         
         frame_number += 1
-        # Simulate frame rate (e.g., 1 frame per second).
-        time.sleep(1)
+        # Use the specified frame interval
+        time.sleep(frame_interval)
 
-def stream_video():
+def stream_video(camera_id, frame_interval):
     # Discover the current leader
     server_address = discover_server()
     
@@ -88,9 +96,9 @@ def stream_video():
     
     while retry_count < max_retries:
         try:
-            response_iterator = stub.StreamVideo(generate_frames())
+            response_iterator = stub.StreamVideo(generate_frames(camera_id, frame_interval))
             for ack in response_iterator:
-                print(f"Received ack from server: {ack.message}")
+                print(f"Camera {camera_id} received ack from server: {ack.message}")
                 # Reset retry count on successful communication
                 retry_count = 0
         except grpc.RpcError as e:
@@ -108,4 +116,6 @@ def stream_video():
                 break
 
 if __name__ == '__main__':
-    stream_video()
+    args = parse_args()
+    print(f"Starting camera {args.camera_id} with {args.frame_interval} second frame interval")
+    stream_video(args.camera_id, args.frame_interval)

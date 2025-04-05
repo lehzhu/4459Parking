@@ -7,6 +7,8 @@ import argparse
 import os
 import sys
 import random
+import hashlib
+from collections import defaultdict
 
 import video_stream_pb2
 import video_stream_pb2_grpc
@@ -56,6 +58,7 @@ class RaftVideoProcessor(raft_pb2_grpc.RaftServicer):
         # Set up video processing state
         self.frames_processed = 0
         self.last_processed_frame = None
+        self.camera_stats = defaultdict(lambda: {'last_seen': 0, 'frames_processed': 0})
         
         # Create stubs to communicate with peers
         self.peer_stubs = {}
@@ -115,7 +118,7 @@ class RaftVideoProcessor(raft_pb2_grpc.RaftServicer):
                 )
                 
                 # Send RequestVote RPC
-                response = stub.RequestVote(request, timeout=0.5)
+                response = stub.RequestVote(request, timeout=1.0)
                 
                 # Count vote if granted
                 if response.vote_granted:
@@ -180,7 +183,7 @@ class RaftVideoProcessor(raft_pb2_grpc.RaftServicer):
                 )
                 
                 # Send AppendEntries RPC
-                response = stub.AppendEntries(request, timeout=0.5)
+                response = stub.AppendEntries(request, timeout=1.0)
                 
                 # Handle response
                 if response.term > self.current_term:
@@ -199,25 +202,52 @@ class RaftVideoProcessor(raft_pb2_grpc.RaftServicer):
         heartbeat_timer.daemon = True
         heartbeat_timer.start()
     
+    def calculate_parking_spaces(self, frame_data):
+        """Calculate parking spaces from frame data using a hash function."""
+        # Use SHA-256 to generate a deterministic hash from the frame data
+        # This is a substitute for the real vision processing.
+        hash_value = hashlib.sha256(frame_data).hexdigest()
+        
+        # Convert the first 4 characters of the hash to an integer
+        # This gives us a number between 0 and 65535 (16^4)
+        spaces_hash = int(hash_value[:4], 16)
+        
+        # Normalize to a reasonable number of parking spaces (0-100)
+        parking_spaces = spaces_hash % 101
+        
+        return parking_spaces
+
     def process_frame(self, frame):
         """Process a video frame, updating the distributed log."""
         self.frames_processed += 1
         self.last_processed_frame = frame
         
+        # Update camera statistics
+        camera_id = frame.camera_id
+        self.camera_stats[camera_id]['last_seen'] = time.time()
+        self.camera_stats[camera_id]['frames_processed'] += 1
+        
+        # Calculate parking spaces
+        parking_spaces = self.calculate_parking_spaces(frame.data)
+        
         # If we're the leader, append to log and replicate
         if self.state == RaftState.LEADER:
-            # Create log entry
+            # Create log entry with parking spaces calculation
             log_entry = raft_pb2.LogEntry(
                 index=len(self.log) + 1,
                 term=self.current_term,
-                command=frame.data
+                command=frame.data,
+                camera_id=camera_id,
+                parking_spaces=parking_spaces,
+                timestamp=frame.timestamp
             )
             self.log.append(log_entry)
             
             # Replicate to followers
             self.replicate_log_to_followers()
             
-            print(f"Leader processed frame #{frame.frame_number} and added to log")
+            # Clearer logging for the leader
+            print(f"[LEADER {self.node_id}] Processed Frame #{frame.frame_number} from Camera {camera_id} -> Parking Spaces: {parking_spaces}")
             return True
         else:
             # If we're not the leader, forward to leader
@@ -258,7 +288,7 @@ class RaftVideoProcessor(raft_pb2_grpc.RaftServicer):
                 )
                 
                 # Send AppendEntries RPC
-                response = stub.AppendEntries(request, timeout=0.5)
+                response = stub.AppendEntries(request, timeout=1.0)
                 
                 # Handle response
                 if response.success:
@@ -331,6 +361,29 @@ class RaftVideoProcessor(raft_pb2_grpc.RaftServicer):
                 
         except Exception as e:
             print(f"Error forwarding frame to leader {leader_id}: {e}")
+    
+    def monitor_cameras(self):
+        """Monitor camera health and handle sudden influx."""
+        while True:
+            current_time = time.time()
+            active_cameras = 0
+            
+            # Check each camera's status
+            for camera_id, stats in self.camera_stats.items():
+                # If camera hasn't been seen in 30 seconds, consider it inactive
+                if current_time - stats['last_seen'] > 30:
+                    print(f"Camera {camera_id} appears to be inactive")
+                else:
+                    active_cameras += 1
+            
+            print(f"Currently monitoring {active_cameras} active cameras")
+            time.sleep(10)  # Check every 10 seconds
+
+    def start_monitoring(self):
+        """Start the camera monitoring thread."""
+        monitor_thread = threading.Thread(target=self.monitor_cameras)
+        monitor_thread.daemon = True
+        monitor_thread.start()
     
     # RAFT RPC implementations
     

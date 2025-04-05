@@ -12,6 +12,7 @@ message VideoFrame {
   int32 frame_number = 1;  // Frame identifier.
   bytes data = 2;          // Simulated frame data (e.g., compressed image bytes).
   int64 timestamp = 3;     // Unix timestamp for when the frame was captured.
+  int32 camera_id = 4;     // Added camera ID field
 }
 
 // Acknowledgment message sent by the server.

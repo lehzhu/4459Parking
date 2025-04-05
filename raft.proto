@@ -1,5 +1,7 @@
 syntax = "proto3";
 
+package raft;
+
 service Raft {
     // Invoked by candidates to gather votes
     rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
@@ -99,6 +101,9 @@ message LogEntry {
     int32 index = 1;
     int32 term = 2;
     bytes command = 3;
+    int32 camera_id = 4;
+    int32 parking_spaces = 5;
+    int64 timestamp = 6;
 }
 
 // Heartbeat request
