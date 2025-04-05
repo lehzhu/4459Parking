@@ -81,7 +81,8 @@ Each camera needs a unique ID. The `--frame-interval` parameter controls how oft
 
 ## 🧪 Testing the System
 
-The system includes a test script that verifies stability and fault tolerance. You can run this script by itself.
+The system includes a test script that verifies stability and fault tolerance. You can run this script by itself, but only after installing packages and 
+generating proto files
 
 ```
 python test_parking_system.py
