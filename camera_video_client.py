@@ -66,7 +66,10 @@ def generate_frames(camera_id, frame_interval):
     while True:
         # Generate a random string for the frame data
         random_data = f"Camera {camera_id} - Frame {frame_number} - Random: {random.randint(1000, 9999)}"
+        random_data = f"Camera {camera_id} - Frame {frame_number} - Random: {random.randint(1000, 9999)}"
         frame_data = random_data.encode('utf-8')
+        
+        # Get current timestamp in Unix format (seconds since epoch)
         timestamp = int(time.time())
         
         frame = video_stream_pb2.VideoFrame(
