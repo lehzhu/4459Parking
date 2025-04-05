@@ -1,97 +1,122 @@
 # 4459Parking
 
-## Distributed Parking System with Real-Time Video Streaming
+## Distributed Parking System with Real-Time Video Processing
 
-This project simulates a distributed system for tracking parking availability on a university campus. It includes both traditional update replication (primary–backup model) and a simulated real-time video stream from campus cameras. RAFT is implemented to handle server outages. 
+This project simulates a distributed system for tracking parking availability on a university campus using camera feeds. It implements the RAFT consensus algorithm to ensure the processing servers remain available even during server failures.
 
-## 🧱 Components
+## System Overview
 
-### 🚗 Parking System
-- parking_primary.py: Handles write requests from clients and forwards updates to the backup.
-- parking_backup.py: Stores replicated parking updates.
-- parking.proto: gRPC definitions for parking update messages and services.
+- **Camera Servers**: Output a frame of video every 10 seconds, each containing a random string
+- **Processing Servers**: Calculate parking spaces from camera frames using a hash function
+- **RAFT Consensus**: Ensures the processing system remains operational even if servers fail
+- **Fault Tolerance**: The system handles both camera failures and processing server failures gracefully
 
-### 🎥 Video Streaming System
-- camera_video_client.py: Simulates a camera sending a live video feed (frame-by-frame).
-- video_processor.py: Receives video frames and processes them (e.g. to detect open spots).
-- video_stream.proto: gRPC definitions for video streaming messages and services.
+## 📋 Components
 
-### 🔄 RAFT Consensus for Fault Tolerance
-- raft_video_processor.py: Video processor with RAFT consensus implementation.
-- raft.proto: Protocol buffer definitions for RAFT RPCs.
-- camera_video_client.py: Enhanced to discover and reconnect to RAFT leaders.
+### Camera System
+- `camera_video_client.py`: Simulates cameras sending frames, with unique camera IDs
+- `video_stream.proto`: Definitions for the video streaming service
 
-## Required Libraries/Packages
+### Processing System
+- `raft_video_processor.py`: Processes video frames with RAFT consensus to calculate parking spaces
+- `raft.proto`: Protocol buffer definitions for RAFT RPCs
 
-Make sure you have Python and PIP installed before proceeding. 
+### Testing & Utilities
+- `start_raft_cluster.py`: Helper script to start a cluster of RAFT nodes
+- `test_parking_system.py`: Testing script to verify system stability and fault tolerance
 
-Run the following command to download required python packages:
+## 🔧 Setup Instructions
+
+### Prerequisites
+- Python 3.6 or higher
+- pip package manager
+
+### Installation
+
+1. Clone the repository:
 ```
-pip install grpcio-tools protobuf 
-```
-
-## 🛠 How to Run:
-
-1. Generate gRPC files from .proto files:
-```
-python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. parking.proto
-python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. video_stream.proto
-python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. raft.proto
-python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. heartbeat_service.proto
-```
-
-2. Start the parking services (in separate terminals):
-```
-python heartbeat_service.py
-python parking_backup.py
-python parking_primary.py
-python video_processor_with_heartbeat.py
-python camera_video_client_with_heartbeat.py
-```
-Monitor heartbeat service health:
-```
-python heartbeat_check.py --monitor
+git clone https://github.com/lehzhu/4459Parking.git
+cd 4459Parking
 ```
 
-3. To use traditional video processing service:
+2. Install required packages:
 ```
-python video_processor.py
+pip install -r requirements.txt
 ```
 
-4. Or to use RAFT-based fault-tolerant video processing (in separate terminals):
-Start 3 RAFT nodes:
+3. Generate gRPC code from proto files:
+```
+python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. *.proto
+```
+   Or simply run:
+```
+make
+```
+
+## 🚀 Running the System
+
+### Starting RAFT Processing Servers
+
+Use the helper script to start a cluster of 3 RAFT nodes (recommended):
+```
+python start_raft_cluster.py
+```
+
+Or start individual nodes manually:
 ```
 python raft_video_processor.py --id 1 --port 60061 --peers "2:localhost:60062,3:localhost:60063"
 python raft_video_processor.py --id 2 --port 60062 --peers "1:localhost:60061,3:localhost:60063"
-python raft_video_processor.py --id 3 --port 60063 --peers "1:localhost:60061,2:localhost:60063"
+python raft_video_processor.py --id 3 --port 60063 --peers "1:localhost:60061,2:localhost:60062"
 ```
 
-5. Run the camera simulation:
+### Starting Camera Clients
+
+Start one or more camera clients (in separate terminals):
 ```
-python camera_video_client.py
+python camera_video_client.py --camera-id 1 --frame-interval 10
+python camera_video_client.py --camera-id 2 --frame-interval 10
 ```
 
-## 📦 What It Simulates
-- A campus camera sends live "video frames" to a central processing node.
-- The processor extracts simulated data from each frame (e.g., parking availability).
-- Parking data is replicated to a backup server for fault tolerance.
-- With RAFT, video processing can continue even if nodes fail.
+Each camera needs a unique ID. The `--frame-interval` parameter controls how often (in seconds) the camera sends a frame.
 
-## ✅ Features
-- Distributed primary–backup replication for parking data.
-- Real-time gRPC streaming of video frames.
-- RAFT consensus algorithm for fault-tolerant video processing.
-- Automatic leader election and log replication with RAFT.
-- Client-side server discovery to find the current leader.
-- Easy to extend with actual computer vision or ML processing.
+## 🧪 Testing the System
 
-## 🧠 RAFT Consensus Algorithm
+The system includes a test script that verifies stability and fault tolerance. You can run this script by itself.
 
-The RAFT consensus algorithm implementation enables fault tolerance for video processing by:
-- Electing a leader to handle client requests
-- Replicating video processing logs to follower nodes
-- Maintaining consistency when nodes fail
-- Automatically handling leader failures through re-election
-- Forwarding client requests to the current leader
+```
+python test_parking_system.py
+```
+
+This will run a series of tests:
+1. **Test #1**: System Stability & Activity Monitoring
+2. **Test #2**: RAFT Node Failure Tolerance
+3. **Test #3**: Camera Failure Tolerance 
+4. **Test #4**: RAFT Node Recovery
+5. **Test #5**: Camera Recovery
+
+Test logs are stored in the `test_logs` directory.
+
+## 🔍 How It Works
+
+1. Camera clients generate random "frames" and send them to processing servers
+2. RAFT nodes elect a leader to handle processing
+3. The leader calculates parking spaces from each frame using a hash function
+4. Results are replicated to follower nodes for fault tolerance
+5. If a leader fails, a new one is automatically elected
+6. Cameras automatically discover and connect to the current leader
+
+## 🐞 Troubleshooting
+
+- **Connection Refused**: Ensure all RAFT nodes are started and have had enough time to elect a leader
+- **Leader Election Issues**: Check logs in `test_logs` directory for timing problems
+- **Camera Connection Issues**: Verify the ports match between camera clients and processing servers
+
+## 🔄 RAFT Consensus Algorithm
 
 The implementation follows the protocol described in the [RAFT paper](https://raft.github.io/raft.pdf) with adaptations for video processing.
+
+Key features:
+- Leader election for determining which node processes requests
+- Log replication for ensuring data consistency across nodes
+- Automatic failure detection and recovery
+- Camera client server discovery to find the current leader
